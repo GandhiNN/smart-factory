@@ -2,7 +2,7 @@
 
 ## The one big idea
 
-**Separate the process from how we _observe_ it
+**Separate the process from how we _observe_ it**
 
 A real plant floor exists whether or not anyone is watching. Tobacco sheet moves through heater zones, sticks get weighed, the machine runs or trips -> all of that is physical reality. _Then_, separately, we bolt on ways to observe it: an OPC-UA server, a Modbus gateway, a dashboard.
 
