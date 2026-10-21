@@ -1,0 +1,10 @@
+[package]
+name = "opcua-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-opcua = { workspace = true }
+tokio = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }

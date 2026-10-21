@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sfp-sim-core",
+    "crates/opcua-server",
+    "crates/opcua-client",
+]
+
+# Shared dependency versions live here so every member crate stays in sync.
+# Member crates refer to these with `foo = { workspace = true }`.
+[workspace.dependencies]
+async-opcua = { version = "0.19", features = ["server", "client"] }
+tokio = { version = "1", features = ["full"] }
+env_logger = "0.11"
+log = "0.4"
+rand = "0.8"
