@@ -1,0 +1,23 @@
+[package]
+name = "mqtt-bridge"
+version = "0.1.0"
+edition = "2021"
+
+# The edge gateway: subscribes to the OPC-UA server and republishes each
+# value change to an MQTT broker. Reuses the OPC-UA subscription mechanics
+# from the opcua-client, but swaps "print" for "publish to MQTT"
+[dependencies]
+# Domain types (Quality, etc.) - protocol-agnostic core.
+sfp-sim-core = { path = "../sfp-sim-core" }
+
+# OPC-UA client side (we only need the client feature here).
+async-opcua = { workspace = true }
+
+# Async runtime + logging, shared across the workspace.
+tokio = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }
+
+# MQTT client (pure-Rust, Tokio-based) and JSON payload encoding.
+rumqttc = { workspace = true }
+serde_json = { workspace = true }
