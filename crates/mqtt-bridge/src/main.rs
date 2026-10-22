@@ -27,6 +27,7 @@ use opcua::types::{
     BrowseDirection,
     BrowseResultMask,
     DataValue,
+    Identifier,
     MessageSecurityMode,
     MonitoredItemCreateRequest,
     NodeClass,
@@ -45,7 +46,8 @@ use rumqttc::{
 };
 
 /// OPC-UA server endpoint (the source of plant-floor data).
-const SERVER_URL: &str = "opc.tcp://localhost:4840/";
+/// Use an explicit IPv4 address, not `localhost`
+const SERVER_URL: &str = "opc.tcp://127.0.0.1:4840/";
 
 /// The namespace URI our line lives under on the server.
 const NAMESPACE_URI: &str = "urn:smart-factory:sfp";
@@ -238,7 +240,12 @@ fn publish_change(mqtt_client: &AsyncClient, value: &DataValue, item: &Monitored
     let node_id = &item.item_to_monitor().node_id;
 
     // NodeId identifier is a string like "Line1/HeaterZone1/Temperature".
-    let identifier = node_id.identifier.to_string();
+
+
+    let identifier = match &node_id.identifier {
+        Identifier::String(s) => s.to_string(),
+        other => other.to_string(), // numeric/guid/opaque: fall back to tagged form
+    };
     let topic = format!("{TOPIC_ROOT}/{identifier}");
 
     let status = value.status.unwrap_or(StatusCode::Good);
