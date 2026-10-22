@@ -250,6 +250,15 @@ fn publish_change(mqtt_client: &AsyncClient, value: &DataValue, item: &Monitored
 
     let status = value.status.unwrap_or(StatusCode::Good);
 
+    // Base quality as a clean string, independent of info bits like Overflow.
+    let quality = if status.is_good() {
+        "Good"
+    } else if status.is_uncertain() {
+        "Uncertain"
+    } else {
+        "Bad"
+    };
+
     // Render the value as a serde_json value where we can; fall back to string.
     let json_value = variant_to_json(value.value.as_ref());
 
@@ -260,6 +269,7 @@ fn publish_change(mqtt_client: &AsyncClient, value: &DataValue, item: &Monitored
 
     let payload = serde_json::json!({
         "value": json_value,
+        "quality": quality,
         "status": &status.to_string(),
         "ts": ts,
     });
