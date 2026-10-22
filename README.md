@@ -38,3 +38,10 @@ The `MakerLine` composes:
 
 ## The server's rhythm: scan, then publish
 <TBC>
+
+
+# Appendix
+
+"EU" = **Engineering Units** is a standard OPC-UA / instrumentation terminology. The `EURange` property on an analog node is literally the low/high of the real-world measurement range, as opposed to a raw/scaled value.
+
+"EU span" = **Engineering Units span** - the width of a signal's normal operating band, i.e. `eu_high - eu_low.`
