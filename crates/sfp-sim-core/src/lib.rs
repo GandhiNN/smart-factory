@@ -15,3 +15,11 @@ pub mod signal;
 pub use line::{MachineState, MakerLine};
 pub use quality::Quality;
 pub use signal::Signal;
+
+// Config-driven line construction. Behind a feature flag so the core stays
+// serde-free by default
+#[cfg(feature = "config")]
+pub mod config;
+
+#[cfg(feature = "config")]
+pub use config::{ConfigError, LineConfig, SignalConfig};
