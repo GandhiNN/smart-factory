@@ -58,3 +58,9 @@ It's:
 3. **Throughput** - a monotonically increasing counter (sticks produced). Only increases while Running.
 4. **Fault behavior** - real machines degrade: sensors drop out, values drift, the machine trips and stops. We inject these probabilistically so downstream analytics has something to detech.
 
+## OPC-UA Overflow
+
+An OPC-UA `StatusCode` is a 32-but value: the top bits are the severity/code (Good/Uncertain/Bad + reason), and lower "info bits" carry flags. The **Overflow** bit means _"this subscription's queue overflowed - at least one notification was dropped before this one."_
+
+Why it's happening: your monitored items use the default queue size of 1. When the server produces values faster than the client drains them for a moment, the single-slot queue overflows and the server sets the Overflow bit on the next delivered value. At a 500ms interval with 6 items, it's harmess and intermittent.
+
