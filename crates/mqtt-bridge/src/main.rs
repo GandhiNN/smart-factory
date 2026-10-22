@@ -1,31 +1,38 @@
 //! MQTT bridge: the OT->IT edge gateway.
 //! 
-//! Subscribes to the simulated SFP maker line over OPC-UA (the exact same
-//! subscription mechanics as `opcua-client`) and, instead of printing each
-//! data change, PUBLISHES it to an MQTT broker. This is the real hand-off 
-//! from the plant-floor protocol (OPC-UA) to the message-bus world (MQTT
-//! -> Kafka -> analytics).
+//! Subscribes to the simulated SFP maker line over OPC-UA and republishes each data change to an MQTT broker.
+//! The set of nodes to monitor is DISCOVERED by browsing the 
+//! server's address space at runtime - the bridge is never told
+//! the line's shape in advance.
+//! This is how real OPC-UA clients work
 //! 
-//! Plain-topic / JSON payload first; Sparkplug B comes later.
+//! Plain-topic / JSON payload; Sparkplug B comes later
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use log::{error, warn};
+use log::{error, info, warn};
+use opcua::client::services::Browse;
 use opcua::client::{
     ClientBuilder,
     DataChangeCallback,
     IdentityToken,
     MonitoredItem,
     Session,
+    UARequest,
 };
 use opcua::crypto::SecurityPolicy;
 use opcua::types::{
+    BrowseDescription,
+    BrowseDirection,
+    BrowseResultMask,
     DataValue,
     MessageSecurityMode,
     MonitoredItemCreateRequest,
+    NodeClass,
+    NodeClassMask,
     NodeId,
-    ReadValueId,
+    ReferenceTypeId,
     StatusCode,
     TimestampsToReturn,
     UserTokenPolicy,
@@ -58,9 +65,7 @@ const TOPIC_ROOT: &str = "smart-factory";
 async fn main() -> Result<(), ()> {
     env_logger::init();
 
-    // 1. Connect to the MQTT broker. `AsyncClient` is what we publish with;
-    //  the `EventLoop` must be polled continuously or nothing is actually
-    //  sent - publishes just queue. So we spawn a task to drive it.
+    // 1. Connect to the MQTT broker. Spawn the event loop or nothing sends.
     let mut mqtt_options = MqttOptions::new(MQTT_CLIENT_ID, MQTT_HOST, MQTT_PORT);
     mqtt_options.set_keep_alive(Duration::from_secs(5));
     let (mqtt_client, mut mqtt_eventloop) = AsyncClient::new(mqtt_options, 32);
@@ -68,11 +73,8 @@ async fn main() -> Result<(), ()> {
     tokio::spawn(async move {
         loop {
             match mqtt_eventloop.poll().await {
-                Ok(_event) => {
-                    /* connection events; ignore for now */
-                }
+                Ok(_event) => {}
                 Err(e) => {
-                    // rumqttc auto-reconnects; log and keep polling.
                     warn!("MQTT event loop error: {e}");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
@@ -80,7 +82,7 @@ async fn main() -> Result<(), ()> {
         }
     });
 
-    // 2. Connect to the OPC-UA server (same as opcua-client).
+    // 2. Connect to the OPC-UA server.
     let mut client = ClientBuilder::new()
         .application_name("SFP Smart Factory MQTT Bridge")
         .application_uri("urn:smart-factory:mqtt-bridge")
@@ -129,10 +131,22 @@ async fn main() -> Result<(), ()> {
     Ok(())
 }
 
-/// Create a subscription and monitor the line's nodes. Each data change is
-/// published to MQTT by the callback (which captures a clone of the MQTT client).
+/// Create a subscription and monitor every variable discovered under the line folder. 
+/// The callback publishes each change to MQTT.
 async fn subscribe(session: Arc<Session>, mqtt_client: AsyncClient) -> Result<(), StatusCode> {
-    let ns = resolve_namespace_index(&session, NAMESPACE_URI).await?;
+    // Resolve our namespace index using the built-in helper
+    // (reads and caches the server's NamespaceArray for us)
+
+    let ns = session
+        .get_namespace_index(NAMESPACE_URI)
+        .await
+        .map_err(|e| e.status())?;
+
+    // Discover the variable nodes by browsing the server - no hardcoded list.
+    let nodes = discover_variables(&session, ns).await?;
+    if nodes.is_empty() {
+        warn!("Discovered no variables under the line folder; nothing to monitor.");
+    }
 
     let subscription_id = session
         .create_subscription(
@@ -149,49 +163,77 @@ async fn subscribe(session: Arc<Session>, mqtt_client: AsyncClient) -> Result<()
         .await?;
     println!("Created subscription id = {subscription_id}");
 
-    let node_names = [
-        format!("{LINE}/HeaterZone1/Temperature"),
-        format!("{LINE}/HeaterZone2/Temperature"),
-        format!("{LINE}/Sheet/Moisture"),
-        format!("{LINE}/Checkweigher/Weight"),
-        format!("{LINE}/State"),
-        format!("{LINE}/Throughput"),
-    ];
-
-    let items: Vec<MonitoredItemCreateRequest> = node_names
+    let items: Vec<MonitoredItemCreateRequest> = nodes
         .iter()
-        .map(|name| NodeId::new(ns, name.clone()).into())
-        .collect();
+        .cloned()
+        .map(|n| n.into()).collect();
 
     let result = session
         .create_monitored_items(
             subscription_id, 
             TimestampsToReturn::Both, 
             items)
-            .await?;
-    
-    for (name, created) in node_names.iter().zip(result.iter()) {
+        .await?;
+
+    for (node, created) in nodes.iter().zip(result.iter()) {
         let status = created.result.status_code;
         if status.is_good() {
-            println!("  monitoring OK: {name}");
+            println!("  monitoring OK: {node}");
         } else {
-            println!("  FAILED to monitor {name}: {status}");
+            println!("  FAILED to monitor {node}: {status}");
         }
     }
-
-    println!("Monitoring {} nodes. Bridging to MQTT...\n", node_names.len());
-
+    println!("Monitoring {} discovered nodes. Bridging to MQTT...\n", nodes.len());
     Ok(())
 }
 
+/// Browse the server to discover all Variable nodes under the line folder.
+/// 
+/// The line folder is `NodeId(ns, "Line1")` (the server built it that way).
+/// We ask for forward hierarchical references and keep only those whose target
+/// NodeClass is Variable, returning their NodeIds. This decouples the bridge
+/// from the line's shape entirely: add a signal to the server's config and the
+/// bridge picks it up with no code change.
+async fn discover_variables(session: &Session, ns: u16) -> Result<Vec<NodeId>, StatusCode> {
+    let line_folder = NodeId::new(ns, LINE);
+
+    let to_browse = BrowseDescription {
+        node_id: line_folder,
+        browse_direction: BrowseDirection::Forward,
+        reference_type_id: ReferenceTypeId::HierarchicalReferences.into(),
+        include_subtypes: true,
+        node_class_mask: NodeClassMask::VARIABLE.bits(),
+        result_mask: BrowseResultMask::All as u32,
+    };
+
+    let response = Browse::new(session)
+        .browse_node(to_browse)
+        .send(session.channel())
+        .await
+        .map_err(|e| e.status())?;
+
+    let mut nodes = Vec::new();
+    if let Some(results) = response.results {
+        for result in results {
+            if let Some(refs) = result.references {
+                for r in refs {
+                    if r.node_class == NodeClass::Variable {
+                        // ExpandedNodeId -> NodeId (local server, so this is direct).
+                        nodes.push(r.node_id.node_id);
+                    }
+                }
+            }
+        }
+    }
+
+    info!("Browse discovered {} variable node(s) under {LINE}", nodes.len());
+    Ok(nodes)
+}
 
 /// Publish one data-change notification to MQTT.
 /// 
 /// Topic:  smart-factory/<node-identifier> e.g. smart-factory/Line1/HeaterZone1/Temperature
 /// Payload: JSON { "value": <v>, "status": "<status>", "ts": "<source_timestamp>" }
-/// 
-/// Uses `try_publish`, which is non-blocking and safe to call from this
-/// synchronous callback: it enqeueues onto the MQTT event loop we spawned.
 fn publish_change(mqtt_client: &AsyncClient, value: &DataValue, item: &MonitoredItem) {
     let node_id = &item.item_to_monitor().node_id;
 
@@ -247,34 +289,4 @@ fn variant_to_json(v: Option<&Variant>) -> serde_json::Value {
         Some(other) => Value::String(format!("{other:?}")),
         None => Value::Null,
     }
-}
-
-/// Resolve the namespace index for `uri` at runtime via Server_NamespaceArray
-/// (NodeId i=2255). Same approach as opcua-client.
-async fn resolve_namespace_index(session: &Session, uri: &str) -> Result<u16, StatusCode> {
-    let namespace_array_node = NodeId::new(0u16, 2255u32);
-    let to_read = ReadValueId::from(namespace_array_node);
-    let results = session
-        .read(&[to_read], TimestampsToReturn::Neither, 0.0)
-        .await
-        .map_err(|e| e.status())?;
-
-    let value = results
-        .into_iter()
-        .next()
-        .and_then(|dv| dv.value)
-        .ok_or(StatusCode::BadNoData)?;
-
-    let Variant::Array(array) = value else {
-        return Err(StatusCode::BadTypeMismatch);
-    };
-
-    for (index, element) in array.values.iter().enumerate() {
-        if let Variant::String(s) = element {
-            if s.as_ref() == uri {
-                return Ok(index as u16);
-            }
-        }
-    }
-    Err(StatusCode::BadNotFound)
 }
