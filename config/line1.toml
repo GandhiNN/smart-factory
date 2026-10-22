@@ -1,0 +1,38 @@
+# Definition of a simulated SFP maker line.
+# The OPC-UA server builds its entire address space from this file, so adding
+# or returning a signal here requires no code changes or recompile.
+
+name = "Line1"
+fault_rate = 0.02   # ~2% chance of a fault event per tick
+
+# Two heater zones. Heated-tobacco substrate must stay hot enough to aerosolize
+# but well below combustion - hence a tight band.
+[[signals]]
+name = "HeaterZone1/Temperature"
+unit = "devC"
+eu_low = 150.0
+eu_high = 175.0
+setpoint = 162.0
+
+[[signals]]
+name = "HeaterZone2/Temperature"
+unit = "degC"
+eu_low = 150.0
+eu_high = 175.0
+setpoint = 165.0
+
+# Moisture of the reconstituted tobacco sheet (%). Tight window.
+[[signals]]
+name = "Sheet/Moisture"
+unit = "percent"
+eu_low = 12.0
+eu_high = 14.0
+setpoint = 13.0
+
+# Checkweigher: mass per stick (grams).
+[[signals]]
+name = "Checkweigher/Weight"
+unit = "g"
+eu_low = 0.85
+eu_high = 0.95
+setpoint = 0.90
