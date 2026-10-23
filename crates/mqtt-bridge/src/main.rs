@@ -5,8 +5,10 @@
 //! server's address space at runtime - the bridge is never told
 //! the line's shape in advance.
 //! This is how real OPC-UA clients work
-//! 
-//! Plain-topic / JSON payload; Sparkplug B comes later
+mod sparkplug;
+
+use sparkplug::BirthMetric;
+use sparkplug_rs::sparkplug_b::payload::metric::Value as SpValue;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,6 +35,7 @@ use opcua::types::{
     NodeClass,
     NodeClassMask,
     NodeId,
+    ReadValueId,
     ReferenceTypeId,
     StatusCode,
     TimestampsToReturn,
@@ -89,19 +92,23 @@ fn node_topic(msg_type: NodeMessageType) -> String {
 async fn main() -> Result<(), ()> {
     env_logger::init();
 
+    // 0. identifies THIS MQTT session. Fresh process -> 0.
+    // Reused in the Will (NDEATH) and the NBIRTH so a consumer
+    // can pair death<->birth.
+    let bd_seq: u64 = 0;
+
     // 1. Connect to the MQTT broker. Spawn the event loop or nothing sends.
     let mut mqtt_options = MqttOptions::new(MQTT_CLIENT_ID, MQTT_HOST, MQTT_PORT);
     mqtt_options.set_keep_alive(Duration::from_secs(5));
 
-    // Arm the Last Will: if this bridge dies without a clean disconnect, the
-    // broker publishes this death notice on our behalf (after ~1.5x keep-alive
-    // of silence). Retained, so late-joining consumers see it immediately.
-    let death_payload = serde_json::json!({"online": false}).to_string();
-    mqtt_options.set_last_will(LastWill::new(
-        node_topic(NodeMessageType::NDEATH),
-        death_payload.into_bytes(),
-        QoS::AtLeastOnce,
-        true, // retain
+    // NDEATH = our Last Will. Protobuf payload carrying only the bdSeq metric.
+    // Armed before connect; the broker fires it if we vanish without a clean DISCONNECT.
+    let death_payload = sparkplug::encode_ndeath(bd_seq);
+    mqtt_options.set_last_will(LastWill::new( 
+        node_topic(NodeMessageType::NDEATH), 
+        death_payload, 
+        QoS::AtLeastOnce, 
+        true, // retain 
     ));
 
     let (mqtt_client, mut mqtt_eventloop) = AsyncClient::new(mqtt_options, 32);
@@ -150,7 +157,7 @@ async fn main() -> Result<(), ()> {
     // Clone for the shutdown handler before `subscribe` takes ownership.
     let mqtt_shutdown = mqtt_client.clone();
 
-    if let Err(status) = subscribe(session.clone(), mqtt_client).await {
+    if let Err(status) = subscribe(session.clone(), mqtt_client, bd_seq).await {
         error!("Failed to subscribe: {status}");
         let _ = session.disconnect().await;
         return Err(());
@@ -166,17 +173,16 @@ async fn main() -> Result<(), ()> {
             return;
         }
 
-        // Clean shutdown: publish the death ourselves (retained), then send a
-        // proper MQTT DISCONNECT so the broker discards the armed Will (it must
-        // NOT also fire). `publish`/`disconnect` only enqueue onto the event
-        // loop, so give it a brief moment to flush both to the wire.
-        let death = serde_json::json!({"online": false}).to_string();
+        // Clean shutdown: publish our OWN NDEATH (same bdSeq) so
+        // the broker can discard the armed Will.
+        // Retained so late joiners see we are offline.
+        let death = sparkplug::encode_ndeath(bd_seq);
         if let Err(e) = mqtt_shutdown
             .publish(
                 node_topic(NodeMessageType::NDEATH), 
                 QoS::AtLeastOnce, 
                 true, 
-                death.into_bytes(),
+                death,
             )
             .await {
                 warn!("Failed to publish death notice: {e}");
@@ -195,7 +201,7 @@ async fn main() -> Result<(), ()> {
 
 /// Create a subscription and monitor every variable discovered under the line folder. 
 /// The callback publishes each change to MQTT.
-async fn subscribe(session: Arc<Session>, mqtt_client: AsyncClient) -> Result<(), StatusCode> {
+async fn subscribe(session: Arc<Session>, mqtt_client: AsyncClient, bd_seq: u64) -> Result<(), StatusCode> {
     // Resolve our namespace index using the built-in helper
     // (reads and caches the server's NamespaceArray for us)
 
@@ -210,32 +216,57 @@ async fn subscribe(session: Arc<Session>, mqtt_client: AsyncClient) -> Result<()
         warn!("Discovered no variables under the line folder; nothing to monitor.");
     }
 
-    // Publish the BIRTH: announce we're online and list the metrics we'll 
-    // report (discovered, not hardcoded). Retained so late-joining consumers
-    // learn our liveness and tag list immediately.
-    let metrics: Vec<String> = nodes
+    // Read the current value of every discovered node so the NBIRTH can carry
+    // real starting values (an NBIRTH is a full snapshot, not just a tag list).
+    let read_ids: Vec<ReadValueId> = nodes
         .iter()
-        .map(|n| match &n.identifier {
+        .map(|n| ReadValueId::from(n.clone()))
+        .collect();
+
+    let values: Vec<DataValue> = session
+        .read(&read_ids, TimestampsToReturn::Both, 0.0)
+        .await?;
+
+    // Build one BirthMetric per node. Alias = position + 1
+    // (aliases are 1-based nicknames; 0 is avoided by convention)
+    // The values Vec lines up positionally with nodes because 
+    // read() preserves order.
+    let mut birth_metrics: Vec<BirthMetric> = Vec::with_capacity(nodes.len());
+    for (idx, (node, dv)) in nodes.iter().zip(values.iter()).enumerate() {
+        let name = match &node.identifier {
             Identifier::String(s) => s.to_string(),
             other => other.to_string(),
-        })
-        .collect();
-    let birth = serde_json::json!({
-        "online": true,
-        "ts": opcua::types::DateTime::now().to_string(),
-        "metrics": metrics,
-    })
-    .to_string();
+        };
+        let alias = (idx as u64) + 1;
+
+        // Map the OPC-UA Variant to a Sparkplug (datatype, Value).
+        // Unknown types degrade to a String metric so we never 
+        // silently drop a node.
+        let (datatype, value) = variant_to_sparkplug(dv.value.as_ref());
+
+        birth_metrics.push(BirthMetric { 
+            name, 
+            alias, 
+            datatype, 
+            value 
+        });
+    }
+
+    let nbirth = sparkplug::encode_nbirth(
+        bd_seq, 
+        &birth_metrics
+    );
     if let Err(e) = mqtt_client
         .publish(
             node_topic(NodeMessageType::NBIRTH), 
             QoS::AtLeastOnce, 
             true, 
-            birth.into_bytes(),
+            nbirth
         )
         .await {
-            warn!("Failed to publish birth notice: {e}");
+            warn!("Failed to publish NBIRTH: {e}");
         }
+    println!("Published NBIRTH with {} metrics (bdSeq={bd_seq})", birth_metrics.len());
 
     let subscription_id = session
         .create_subscription(
@@ -392,5 +423,23 @@ fn variant_to_json(v: Option<&Variant>) -> serde_json::Value {
         Some(Variant::Boolean(b)) => serde_json::json!(b),
         Some(other) => Value::String(format!("{other:?}")),
         None => Value::Null,
+    }
+}
+
+/// Convert an OPC-UA Variant into a Sparkplug (dataype_code, metric Value).
+/// Anything we don't explicitly model degrades to a STRING metric so no node
+/// is ever silently dropped from the birth.
+fn variant_to_sparkplug(v: Option<&Variant>) -> (u32, SpValue) {
+    use sparkplug::datatype;
+    match v {
+        Some(Variant::Double(n)) => (datatype::DOUBLE, SpValue::DoubleValue(*n)),
+        Some(Variant::Float(n)) => (datatype::DOUBLE, SpValue::DoubleValue(*n as f64)),
+        Some(Variant::Int64(n)) => (datatype::INT64, SpValue::LongValue(*n as u64)),
+        Some(Variant::Int32(n)) => (datatype::INT32, SpValue::IntValue(*n as u32)),
+        Some(Variant::UInt32(n)) => (datatype::UINT32, SpValue::IntValue(*n)),
+        Some(Variant::UInt64(n)) => (datatype::UINT64, SpValue::LongValue(*n)),
+        Some(Variant::Boolean(b)) => (datatype::BOOLEAN, SpValue::BooleanValue(*b)),
+        Some(other) => (datatype::STRING, SpValue::StringValue(format!("{other:?}"))),
+        None => (datatype::STRING, SpValue::StringValue(String::new())),
     }
 }
