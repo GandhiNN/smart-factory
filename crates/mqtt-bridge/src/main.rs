@@ -43,7 +43,13 @@ use rumqttc::{
     AsyncClient,
     LastWill,
     MqttOptions,
-    QoS
+    QoS,
+};
+
+use sparkplug_rs::{
+    NodeMessageType,
+    TopicName,
+    TopicNamespace,
 };
 
 /// OPC-UA server endpoint (the source of plant-floor data).
@@ -61,11 +67,23 @@ const MQTT_HOST: &str = "127.0.0.1";
 const MQTT_PORT: u16 = 1883;
 const MQTT_CLIENT_ID: &str = "sfp-mqtt-bridge";
 
-/// Root of the topic tree we publish under: `smart-factory/<node-identifier>`
+/// Root of the topic tree published under `smart-factory/<node-identifier>`
 const TOPIC_ROOT: &str = "smart-factory";
 
-/// Liveness/discovery status topic for this edge node (birth/death live here).
-const STATUS_TOPIC: &str = "smart-factory/Line1/status";
+/// Group and edge-node identity
+const SP_GROUP: &str = "smart-factory";
+const SP_EDGE_NODE: &str = "Line1";
+
+/// Topic strings helper producers
+fn node_topic(msg_type: NodeMessageType) -> String {
+    TopicName::new_node_message(
+        TopicNamespace::SPBV1_0,
+        SP_GROUP.to_string(),
+        msg_type,
+        SP_EDGE_NODE.to_string(),
+    )
+    .to_string()
+}
 
 #[tokio::main]
 async fn main() -> Result<(), ()> {
@@ -80,7 +98,7 @@ async fn main() -> Result<(), ()> {
     // of silence). Retained, so late-joining consumers see it immediately.
     let death_payload = serde_json::json!({"online": false}).to_string();
     mqtt_options.set_last_will(LastWill::new(
-        STATUS_TOPIC,
+        node_topic(NodeMessageType::NDEATH),
         death_payload.into_bytes(),
         QoS::AtLeastOnce,
         true, // retain
@@ -154,7 +172,12 @@ async fn main() -> Result<(), ()> {
         // loop, so give it a brief moment to flush both to the wire.
         let death = serde_json::json!({"online": false}).to_string();
         if let Err(e) = mqtt_shutdown
-            .publish(STATUS_TOPIC, QoS::AtLeastOnce, true, death.into_bytes())
+            .publish(
+                node_topic(NodeMessageType::NDEATH), 
+                QoS::AtLeastOnce, 
+                true, 
+                death.into_bytes(),
+            )
             .await {
                 warn!("Failed to publish death notice: {e}");
             }
@@ -162,7 +185,7 @@ async fn main() -> Result<(), ()> {
             warn!("Failed to disconnect MQTT client: {e}");
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
-        
+
         let _ = session_c.disconnect().await;
     });
 
@@ -204,7 +227,12 @@ async fn subscribe(session: Arc<Session>, mqtt_client: AsyncClient) -> Result<()
     })
     .to_string();
     if let Err(e) = mqtt_client
-        .publish(STATUS_TOPIC, QoS::AtLeastOnce, true, birth.into_bytes())
+        .publish(
+            node_topic(NodeMessageType::NBIRTH), 
+            QoS::AtLeastOnce, 
+            true, 
+            birth.into_bytes(),
+        )
         .await {
             warn!("Failed to publish birth notice: {e}");
         }
