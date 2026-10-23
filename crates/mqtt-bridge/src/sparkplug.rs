@@ -27,6 +27,7 @@ use sparkplug_rs::sparkplug_b::{payload::Metric, Payload};
 pub mod datatype {
     pub const INT32: u32 = 3;
     pub const INT64: u32 = 4;
+    pub const UINT32: u32 = 7;
     pub const UINT64: u32 = 8;
     pub const DOUBLE: u32 = 10;
     pub const BOOLEAN: u32 = 11;
