@@ -225,3 +225,72 @@ The NBIRTH payload specifically is the **contract**. It's one message declaring 
 Intuition: NBIRTH is like the header row of a spreadsheet plus a legend. "Column 1 = HeaterZone1/Temperatur, a Double; column 2 = State, an Int." Once the consumer has read that legend, every later data message can just say "column 1 = 162.3" instead of repeating "HeaterZone1/Temperature (Double) = 162.3" every half second. The birth defines the vocabulary; the data speaks in shorthand.
 
 This is why Sparkplug _requires_ a birth before any data: without the legend, the aliases in the data are meaningless. It's also why the Will/death matters - if the node dies and reconnectes, it must send a _fresh_ birth (the legend could have changed), and consumers must discard old aliases.
+
+## The Sparkplug "session"
+
+There are three numbers doing three different jobs.
+
+### The MQTT problem with liveness tracking that Sparkplug is solving
+
+MQTT by itself is dumb about liveness. A publisher connects, sends messages, and maybe disappears - crash, cable yanked, power cut. The broker and the consumers have no built-in way to know "is this device _actually_ still alive, or did it die 20 seconds ago and I'm looking at stale data?"
+
+Sparkplug bolts a **state machine** on top of MQTT so every consumer always knows: who's online, what metrics they have, and whether they've missed anything. The three numbers below are the machinery that makes that possible.
+
+#### 1. bdSeq - "which life am I on?"
+
+**bd** = _birth/death_. Think of it as a **session ticket number**, or more morbidly, a **reincarnation counter**.
+
+Every time your edge node establishes a fresh MQTT connection, it's a new "life." bdSeq labels that life:
+
+- First connection: `bdSeq = 0`
+- Reconnect after a crash: `bdSeq = 1`
+- Reconnect again: `bdSeq = 2`
+- ...wraps around after 255
+
+The magic is the **handshake**: The _same_ `bdSeq` value goes into two messages that are created at opposite ends of a life
+
+- The **NDEATH** ("if i die, tell everyone" note) - armed _before_ we connect.
+- The **NBIRTH** ("I'm alive!" announcement) - sent _right after_ we connect.
+
+Why does that matter? Picture this race condition without `bdSeq`:
+
+1. Device crashes. Broker fires the old death notice.
+2. Device reboots fast and reconnects, sends a birth.
+3. ...but the death notice from step 1 arrives _late_, after the birth.
+
+A naive consumer would now think the device is dead, even though it just came back. **bdSeq fixes this**: the late death carries `bdSeq=0`, but the consumer already saw the new birth with `bdSeq=1`. It goes "that death belongs to the _previous_ life, which I already know ended - ignore it."  Death and birth are paired by their ticket number.
+
+#### 2. seq - "page numbers, so gaps are detectable"
+
+`seq` is a field on _every_ Sparkplug message, and it's a **per-message counter within one life**:
+
+- NBIRTH: seq = 0 (a birth always resets to 0)
+- first NDATA: seq = 1
+- next NDATA: seq = 2
+- ...wraps 255 -> 0 -> 1 ...
+
+The point is **gap detection**. If a consumer sees seq jump from 7 to 9, it knows message 8 vanished. Its correct reaction is: "I might be out of sync - I'd better ask the device to re-send its full NBIRTH snapshot" (a _rebirth request_). Like noticing page 8 is missing from a book and asking for a fresh copy.
+
+Analogy:
+- **bdSeq** = which _edition_ of the book we are holding (reprinted after each death).
+- **seq** = the _page number_ within that edition.
+
+#### 3. alias - "a nickname to save bandwidth"
+
+This is unrelated to liveness. In the NBIRTH we declare each metric with its full name _and_ a small integer alias:
+
+`Line1/HeaterZone1/Temperature` -> alias 1
+`Line1/HeaterZone2/Temperature` -> alias 2
+`Line1/Checkweigher/Weight` -> alias 3
+
+The NBIRTH is the **legend/dictionary**. After that, data messages (NDATA) can drop the long string and just say "alias 3 = 72.4". A metric name might be 40 bytes; the alias is 1. Over millions of messages, that's a huge saving.
+
+The catch: (especially with Telegraf / any other stateless parser) -> a consumer **must have seen the NBIRTH** to know what alias 3 means. A stateless parser that just reads one NDATA message off the wire sees `alias=3, value=72.4` and has no idea what sensor that is. That's exactly why Telegraf's protobuf parser struggles: it does not hold the birth state to resolve aliases back to names.
+
+#### SUMMARY: THE MENTAL MODEL
+
+`bdSeq` = which life
+`seq` = which message in that life
+`alias` = shorthand for a metric defined at birth
+
+Note: Will and clean-shutdown death use the identical `bd_seq`: to a consumer, a crash-death and a graceful-death for the same life should be indistinguishable in identity. The only difference is _how_ the message reached them (broker-fired vs. self-published), never _which life_ it refers to.
