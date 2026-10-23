@@ -147,12 +147,22 @@ async fn main() -> Result<(), ()> {
             warn!("Failed to register Ctrl-C handler: {e}");
             return;
         }
+
+        // Clean shutdown: publish the death ourselves (retained), then send a
+        // proper MQTT DISCONNECT so the broker discards the armed Will (it must
+        // NOT also fire). `publish`/`disconnect` only enqueue onto the event
+        // loop, so give it a brief moment to flush both to the wire.
         let death = serde_json::json!({"online": false}).to_string();
         if let Err(e) = mqtt_shutdown
             .publish(STATUS_TOPIC, QoS::AtLeastOnce, true, death.into_bytes())
             .await {
                 warn!("Failed to publish death notice: {e}");
             }
+        if let Err(e) = mqtt_shutdown.disconnect().await {
+            warn!("Failed to disconnect MQTT client: {e}");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        
         let _ = session_c.disconnect().await;
     });
 
