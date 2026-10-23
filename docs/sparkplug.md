@@ -220,7 +220,7 @@ So the `online` boolean becomes redundant - **the topic is the signal.**
 
 In the common MQTT implementation, the payload is JSON -> human-readable, but every message re-sends field names ("value", "status"...) as text, and there's no standard for datatypes or quality. Sparkplug replaces it with a **protobuf** `Payload`: a compact binary structure with a defined schema everyone agrees on.
 
-The NBIRTH payload specifically is the **contract**. It declares, once: here is every metrics I will ever report, each with its name, its datatype (is this a `Double`? an `Int`? a `Boolean`?), its current value, and - crucially - an **alias**, a small integer nickname. After NBIRTH, data messages refer to metrics by that integer alias instead of the full string name.
+The NBIRTH payload specifically is the **contract**. It's one message declaring every metric's name + datatype + alias + current value, with `seq = 0` e.g. It declares, once: here is every metrics I will ever report, each with its name, its datatype (is this a `Double`? an `Int`? a `Boolean`?), its current value, and - crucially - an **alias**, a small integer nickname. After NBIRTH, data messages refer to metrics by that integer alias instead of the full string name.
 
 Intuition: NBIRTH is like the header row of a spreadsheet plus a legend. "Column 1 = HeaterZone1/Temperatur, a Double; column 2 = State, an Int." Once the consumer has read that legend, every later data message can just say "column 1 = 162.3" instead of repeating "HeaterZone1/Temperature (Double) = 162.3" every half second. The birth defines the vocabulary; the data speaks in shorthand.
 
