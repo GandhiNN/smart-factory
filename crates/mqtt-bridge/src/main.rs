@@ -41,6 +41,7 @@ use opcua::types::{
 };
 use rumqttc::{
     AsyncClient,
+    LastWill,
     MqttOptions,
     QoS
 };
@@ -63,6 +64,9 @@ const MQTT_CLIENT_ID: &str = "sfp-mqtt-bridge";
 /// Root of the topic tree we publish under: `smart-factory/<node-identifier>`
 const TOPIC_ROOT: &str = "smart-factory";
 
+/// Liveness/discovery status topic for this edge node (birth/death live here).
+const STATUS_TOPIC: &str = "smart-factory/Line1/status";
+
 #[tokio::main]
 async fn main() -> Result<(), ()> {
     env_logger::init();
@@ -70,6 +74,18 @@ async fn main() -> Result<(), ()> {
     // 1. Connect to the MQTT broker. Spawn the event loop or nothing sends.
     let mut mqtt_options = MqttOptions::new(MQTT_CLIENT_ID, MQTT_HOST, MQTT_PORT);
     mqtt_options.set_keep_alive(Duration::from_secs(5));
+
+    // Arm the Last Will: if this bridge dies without a clean disconnect, the
+    // broker publishes this death notice on our behalf (after ~1.5x keep-alive
+    // of silence). Retained, so late-joining consumers see it immediately.
+    let death_payload = serde_json::json!({"online": false}).to_string();
+    mqtt_options.set_last_will(LastWill::new(
+        STATUS_TOPIC,
+        death_payload.into_bytes(),
+        QoS::AtLeastOnce,
+        true, // retain
+    ));
+
     let (mqtt_client, mut mqtt_eventloop) = AsyncClient::new(mqtt_options, 32);
 
     tokio::spawn(async move {
@@ -113,19 +129,30 @@ async fn main() -> Result<(), ()> {
     println!("Connected to OPC-UA server {SERVER_URL}");
     println!("Publishing to MQTT broker {MQTT_HOST}:{MQTT_PORT} under '{TOPIC_ROOT}/'");
 
+    // Clone for the shutdown handler before `subscribe` takes ownership.
+    let mqtt_shutdown = mqtt_client.clone();
+
     if let Err(status) = subscribe(session.clone(), mqtt_client).await {
         error!("Failed to subscribe: {status}");
         let _ = session.disconnect().await;
         return Err(());
     }
 
-    // Graceful shutdown on Ctrl-C.
+    // Graceful shutdown on Ctrl-C. On a CLEAN exit the broker discards the
+    // armed Will, so we must publish the death notice ourselves (retained),
+    // then disconnect both connections.
     let session_c = session.clone();
     tokio::spawn(async move {
         if let Err(e) = tokio::signal::ctrl_c().await {
             warn!("Failed to register Ctrl-C handler: {e}");
             return;
         }
+        let death = serde_json::json!({"online": false}).to_string();
+        if let Err(e) = mqtt_shutdown
+            .publish(STATUS_TOPIC, QoS::AtLeastOnce, true, death.into_bytes())
+            .await {
+                warn!("Failed to publish death notice: {e}");
+            }
         let _ = session_c.disconnect().await;
     });
 
@@ -149,6 +176,28 @@ async fn subscribe(session: Arc<Session>, mqtt_client: AsyncClient) -> Result<()
     if nodes.is_empty() {
         warn!("Discovered no variables under the line folder; nothing to monitor.");
     }
+
+    // Publish the BIRTH: announce we're online and list the metrics we'll 
+    // report (discovered, not hardcoded). Retained so late-joining consumers
+    // learn our liveness and tag list immediately.
+    let metrics: Vec<String> = nodes
+        .iter()
+        .map(|n| match &n.identifier {
+            Identifier::String(s) => s.to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+    let birth = serde_json::json!({
+        "online": true,
+        "ts": opcua::types::DateTime::now().to_string(),
+        "metrics": metrics,
+    })
+    .to_string();
+    if let Err(e) = mqtt_client
+        .publish(STATUS_TOPIC, QoS::AtLeastOnce, true, birth.into_bytes())
+        .await {
+            warn!("Failed to publish birth notice: {e}");
+        }
 
     let subscription_id = session
         .create_subscription(
