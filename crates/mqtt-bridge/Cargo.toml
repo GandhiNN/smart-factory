@@ -21,3 +21,6 @@ log = { workspace = true }
 # MQTT client (pure-Rust, Tokio-based) and JSON payload encoding.
 rumqttc = { workspace = true }
 serde_json = { workspace = true }
+
+# Sparkplug dependencies
+sparkplug-rs = { workspace = true }
