@@ -215,3 +215,13 @@ In Sparkplug, birth and death are _different message types with their own topics
 In the common MQTT implementation, liveness is one topic carrying an `online: true/false` flag -> we encode the meaning _in the payload_. Sparkplug encodes it _in the topic_: NBIRTH and NDEATH are distinct addresses, so a consumer can susbcribe to just births or just deaths and route them differently without parsing payloads. The message type is part of the address, not a field inside it.
 
 So the `online` boolean becomes redundant - **the topic is the signal.**
+
+## The Sparkplug protobuf NBIRTH
+
+In the common MQTT implementation, the payload is JSON -> human-readable, but every message re-sends field names ("value", "status"...) as text, and there's no standard for datatypes or quality. Sparkplug replaces it with a **protobuf** `Payload`: a compact binary structure with a defined schema everyone agrees on.
+
+The NBIRTH payload specifically is the **contract**. It declares, once: here is every metrics I will ever report, each with its name, its datatype (is this a `Double`? an `Int`? a `Boolean`?), its current value, and - crucially - an **alias**, a small integer nickname. After NBIRTH, data messages refer to metrics by that integer alias instead of the full string name.
+
+Intuition: NBIRTH is like the header row of a spreadsheet plus a legend. "Column 1 = HeaterZone1/Temperatur, a Double; column 2 = State, an Int." Once the consumer has read that legend, every later data message can just say "column 1 = 162.3" instead of repeating "HeaterZone1/Temperature (Double) = 162.3" every half second. The birth defines the vocabulary; the data speaks in shorthand.
+
+This is why Sparkplug _requires_ a birth before any data: without the legend, the aliases in the data are meaningless. It's also why the Will/death matters - if the node dies and reconnectes, it must send a _fresh_ birth (the legend could have changed), and consumers must discard old aliases.
