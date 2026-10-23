@@ -186,3 +186,32 @@ The audience is the downstream IT consumer (e.g. Kafka connector, analytics host
 - If it later sees the status flip to `{"online": false}`, it knows every value under `Line1/` is now stale and can grey it out / alarm / stop trusting it
 - Instead of sliently showing hour-old data as if live -> the entire _business reason_ why this feature exists: downstream systems can distinguish "live data" from "a dead gateway's ghost" which a plain pub/sub cannot
 
+## The topic _is_ an address
+
+Usually our topics are hand-built strings e.g. `smart-factory/Line1/status`
+
+This works, but it's a private convention - only our code and organization knows what they mean. Sparkplug replaces that with a **fixed, industry-agreed address format**
+
+```bash
+spBv1.0/{group}/{message_type}/{edge_node}
+```
+
+Intuition: think of it like a postal address standard. "123 Main St, Springfield" works because _everyone_ agrees on the house-number/street/city ordering -> any postal service can route it. Sparkplug's topic format is that agreement for industrial MQTT. Any Sparkplug-aware tool (Ignition, HiveMQ, a SCADA system) can look at `spBv1.0/smart-factory/NDATA/Line1` and _immediately_ know: it's Sparkplug v1.0, group "smart-factory", a data message, from edge node "Line1" - without being told about our private conventions. The message _type_ is baked into the address, so a consumer can subscribe to just births (`spBv1.0/smart-factory/NBIRTH/#`) or just data, routing by topic alone.
+
+## The Sparkplug topic model
+
+In the common MQTT implementation, each signal publishes to its _own_ topic (`smart-factory/Line1/HeaterZone1/Temperature`), one MQTT message per signal. In Sparkplug, all metrics share _one_ topic (`spBv1.0/smart-factory/NDATA/Line1`) and the individual metric names live _inside the payload_, not in the topic. 
+
+So Sparkplug fundamentally batches: one NDATA message caries many metrics.
+
+## The Sparkplug liveness model
+
+In the common MQTT implementation, birth and death both publish to a hand-made `STATUS_TOPIC = "smart-factory/Line1/status"`.
+
+In Sparkplug, birth and death are _different message types with their own topics_:
+- Birth -> `spBv1.0/smart-factory/NBIRTH/Line1`
+- Death -> `spBv1.0/smart-factory/NDEATH/Line1`
+
+In the common MQTT implementation, liveness is one topic carrying an `online: true/false` flag -> we encode the meaning _in the payload_. Sparkplug encodes it _in the topic_: NBIRTH and NDEATH are distinct addresses, so a consumer can susbcribe to just births or just deaths and route them differently without parsing payloads. The message type is part of the address, not a field inside it.
+
+So the `online` boolean becomes redundant - **the topic is the signal.**
